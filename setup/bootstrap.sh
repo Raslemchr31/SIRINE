@@ -70,15 +70,12 @@ say "Docker network + stack"
 docker network inspect sirine_net >/dev/null 2>&1 || { docker network create sirine_net >/dev/null; ok "created sirine_net"; }
 
 FRONTEND_URL="$(envget FRONTEND_URL)"
-DOMAIN="$(printf '%s' "$FRONTEND_URL" | sed -E 's|^https?://||; s|[:/].*$||')"
+# The TLS edge proxy (caddy) needs concrete subdomains (CHAT_HOST / ADMIN_HOST) and DNS pointing
+# at this host first, so it is NOT auto-started here. Once your domain resolves, bring it up with:
+#   docker compose --profile edge up -d
+# (instructions are printed at the end). Until then the stack serves plain HTTP on its ports.
 PROFILES=""
-case "$FRONTEND_URL" in
-  https://*)
-    case "$DOMAIN" in
-      localhost|127.0.0.1|*ngrok*|*trycloudflare*) ;;          # tunnels bring their own TLS
-      *) envset DOMAIN "$DOMAIN"; PROFILES="--profile edge"; ok "edge proxy enabled for $DOMAIN (auto-TLS)";;
-    esac;;
-esac
+[ -n "$(envget CHAT_HOST)" ] && [ -n "$(envget ADMIN_HOST)" ] && PROFILES="--profile edge" && ok "edge proxy will start (CHAT_HOST/ADMIN_HOST set)"
 
 docker compose $PROFILES up -d --build
 ok "stack started"
@@ -184,13 +181,17 @@ cat <<EOF
    Chatwoot   : ${FRONTEND_URL:-http://localhost:3037}   (login: $(envget CHATWOOT_ADMIN_EMAIL))
    Catalog UI : http://localhost:8055                    (login: $(envget DIRECTUS_ADMIN_EMAIL))
 
-   1. Meta app webhook (developers.facebook.com → your app → Messenger → Webhooks):
-        Callback URL : ${FRONTEND_URL:-https://YOUR-DOMAIN}/meta/webhook
+   1. Domain + TLS (once your DNS points chat./admin. at this server's IP):
+        set in .env  CHAT_HOST=chat.<domain>  ADMIN_HOST=admin.<domain>
+                     FRONTEND_URL=https://chat.<domain>  DIRECTUS_PUBLIC_URL=https://admin.<domain>
+        then         docker compose --profile edge up -d   (caddy issues TLS automatically)
+   2. Meta app webhook (developers.facebook.com → your app → Messenger → Webhooks):
+        Callback URL : https://chat.<domain>/meta/webhook
         Verify token : $(envget FB_VERIFY_TOKEN)
         Subscribe to : messages, messaging_postbacks, messaging_referrals
-   2. Connect your Facebook page: Chatwoot → Inboxes → New Inbox → Messenger.
-   3. Wire the bot to the new Messenger inbox:  make wire-bot
-   4. Send "salam" to your page — the bot answers in Darija.
+   3. Connect your Facebook page: Chatwoot → Inboxes → New Inbox → Messenger.
+   4. Wire the bot to the new Messenger inbox:  make wire-bot
+   5. Send "salam" to your page — the bot answers in Darija.
 
    Re-running 'make setup' is always safe.
 EOF

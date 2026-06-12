@@ -241,9 +241,9 @@ services:
       - default
       - sirine_net
 
-  # caddy — OPTIONAL edge proxy (profile "edge", enabled automatically by `make setup`
-  # when FRONTEND_URL is a real https domain). Terminates TLS (auto Let's Encrypt) and
-  # routes /meta/webhook → agent-handler (ad attribution relay), everything else → Chatwoot.
+  # caddy — OPTIONAL edge proxy (profile "edge"). Terminates TLS (auto Let's Encrypt) for two
+  # subdomains: CHAT_HOST → Chatwoot (+ /meta/webhook → agent-handler), ADMIN_HOST → Directus.
+  # Bring up with: docker compose --profile edge up -d
   caddy:
     image: caddy:2.8-alpine
     profiles: ["edge"]
@@ -252,7 +252,8 @@ services:
       - "80:80"
       - "443:443"
     environment:
-      DOMAIN: ${DOMAIN:-localhost}
+      CHAT_HOST: ${CHAT_HOST:-localhost}     # e.g. chat.example.com
+      ADMIN_HOST: ${ADMIN_HOST:-localhost}   # e.g. admin.example.com
     volumes:
       - ./infra/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data

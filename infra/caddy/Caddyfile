@@ -1,12 +1,18 @@
-# Edge proxy for the SIRINE stack. DOMAIN comes from .env (derived from FRONTEND_URL
-# by setup/bootstrap.sh). Caddy fetches/renews the TLS certificate automatically.
-{$DOMAIN} {
-	# Meta webhook → agent-handler relay (ad attribution), which forwards to Chatwoot.
+# Edge proxy for the SIRINE stack. CHAT_HOST / ADMIN_HOST come from .env (derived from the domain).
+# Caddy fetches and renews TLS certificates automatically (Let's Encrypt) for both hostnames.
+
+# chat.<domain> → Chatwoot (inbox UI + Facebook page connect), with the Meta webhook relay
+# routed to agent-handler so ad-attribution referrals are captured before forwarding to Chatwoot.
+{$CHAT_HOST} {
 	handle /meta/webhook* {
 		reverse_proxy agent-handler:8082
 	}
-	# Everything else (Chatwoot UI, Facebook page connect, agent dashboard, /bot fallback).
 	handle {
 		reverse_proxy chatwoot-rails:3000
 	}
+}
+
+# admin.<domain> → Directus (catalog + orders admin UI for the team).
+{$ADMIN_HOST} {
+	reverse_proxy directus:8055
 }
