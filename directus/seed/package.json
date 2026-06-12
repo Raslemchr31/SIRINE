@@ -1,0 +1,10 @@
+{
+  "name": "seed",
+  "private": true,
+  "type": "module",
+  "description": "SIRINE catalog bootstrap: idempotent Directus schema + pg_trgm GIN index + seed (run via `make seed`).",
+  "dependencies": {
+    "@directus/sdk": "^21.3.0",
+    "pg": "^8.21.0"
+  }
+}

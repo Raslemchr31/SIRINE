@@ -1,0 +1,18 @@
+# Force LF for files executed inside Linux containers (seed one-shot) and Git Bash,
+# so a fresh Windows clone stays reproducible (M8 DoD). CRLF in run.sh/verify.sh/*.mjs
+# would break `sh run.sh` in node:22 and `bash verify.sh`.
+*.sh        text eol=lf
+*.mjs       text eol=lf
+*.sql       text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.json      text eol=lf
+Makefile    text eol=lf
+*.template  text eol=lf
+directus/seed/** text eol=lf
+infra/**    text eol=lf
+
+# Binary assets — never normalize.
+*.jpg binary
+*.jpeg binary
+*.png binary

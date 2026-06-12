@@ -1,0 +1,11 @@
+{
+  "name": "retrieval-api",
+  "private": true,
+  "type": "module",
+  "description": "SIRINE read-only catalog retrieval (get_product) over Postgres via the catalog_ro role.",
+  "main": "server.mjs",
+  "scripts": { "start": "node server.mjs" },
+  "dependencies": {
+    "pg": "^8.13.0"
+  }
+}

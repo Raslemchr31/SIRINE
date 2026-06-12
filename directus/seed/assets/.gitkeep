@@ -1,0 +1,2 @@
+# Placeholder so directus/seed/assets/ is committed and exists for bootstrap.mjs to read.
+# Real sample .jpg files (referenced by data.mjs images[].file) are added in plan 03's upload task.

@@ -1,0 +1,33 @@
+# secrets — never commit
+.env
+.env.*
+!.env.example
+
+# dependencies / build
+node_modules/
+dist/
+build/
+
+# docker local volumes (if ever bind-mounted)
+data/
+volumes/
+
+# os / editor
+.DS_Store
+Thumbs.db
+*.log
+.idea/
+.vscode/
+*.lnk
+
+# local-only working material — never part of the shipped repo
+.planning/
+.tmp/
+n8n/
+dify/
+sirine-campaign/
+docs/research/
+pitch-ar.html
+PLAN.md
+DEPLOYMENT-PREP-PROMPT.md
+NEXT-SESSION-PROMPT.md

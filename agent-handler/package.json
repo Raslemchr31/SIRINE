@@ -1,0 +1,11 @@
+{
+  "name": "agent-handler",
+  "private": true,
+  "type": "module",
+  "description": "SIRINE agent-handler: Chatwoot AgentBot webhook → Gemini function-calling loop → grounded Darija reply.",
+  "main": "server.mjs",
+  "scripts": { "start": "node server.mjs" },
+  "dependencies": {
+    "redis": "^4.7.0"
+  }
+}
