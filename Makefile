@@ -2,6 +2,10 @@
 .DEFAULT_GOAL := help
 SHELL := /bin/bash
 
+# All targets are commands, not files. Without this, `make setup` is shadowed by the setup/ directory
+# ("make: 'setup' is up to date.") and never runs.
+.PHONY: help verify-pins setup wire-bot up seed verify-seed test smoke down nuke ps logs health
+
 help: ## List targets
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  %-14s %s\n",$$1,$$2}'
 
