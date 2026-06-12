@@ -3,6 +3,10 @@
 .env.*
 !.env.example
 
+# Vertex AI service-account key (never commit) — keep the dir + its README
+agent-handler/vertex/*
+!agent-handler/vertex/README.md
+
 # dependencies / build
 node_modules/
 dist/

@@ -165,8 +165,15 @@ services:
     restart: unless-stopped
     environment:
       PORT: "8082"
+      # LLM backend: aistudio (GEMINI_API_KEY) or vertex (Vertex AI via a service account).
+      LLM_PROVIDER: ${LLM_PROVIDER:-aistudio}
       GEMINI_API_KEY: ${GEMINI_API_KEY}
       GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash}
+      GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
+      GOOGLE_CLOUD_LOCATION: ${GOOGLE_CLOUD_LOCATION:-us-central1}
+      # Vertex auth: drop the service-account key at ./agent-handler/vertex/sa.json (git-ignored);
+      # it's mounted read-only below and ADC reads it here. Harmless/ignored on aistudio.
+      GOOGLE_APPLICATION_CREDENTIALS: /app/vertex/sa.json
       RETRIEVAL_API_URL: http://retrieval-api:8088
       RETRIEVAL_API_KEY: ${RETRIEVAL_API_KEY}
       # Directus assets (P6 image delivery): handler fetches product image bytes with this token
@@ -185,6 +192,9 @@ services:
     volumes:
       - ./agent-handler/system-prompt.md:/app/system-prompt.md:ro
       - ./agent-handler/shipping.json:/app/shipping.json:ro
+      # Directory mount (always exists, even empty) so aistudio installs don't break on a missing
+      # file. For vertex, place the key at ./agent-handler/vertex/sa.json (git-ignored).
+      - ./agent-handler/vertex:/app/vertex:ro
     depends_on:
       redis:
         condition: service_healthy

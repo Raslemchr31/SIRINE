@@ -4,8 +4,9 @@
   "type": "module",
   "description": "SIRINE agent-handler: Chatwoot AgentBot webhook → Gemini function-calling loop → grounded Darija reply.",
   "main": "server.mjs",
-  "scripts": { "start": "node server.mjs" },
+  "scripts": { "start": "node server.mjs", "test": "node --test" },
   "dependencies": {
+    "google-auth-library": "^9.15.0",
     "redis": "^4.7.0"
   }
 }

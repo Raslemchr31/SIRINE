@@ -32,12 +32,20 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createClient } from "redis";
-import { toE164DZ, findWilaya, renderShippingTable, extractReferrals, validateOrderArgs } from "./lib.mjs";
+import { toE164DZ, findWilaya, renderShippingTable, extractReferrals, validateOrderArgs, mergeTurnEntries } from "./lib.mjs";
 
 const PORT = Number(process.env.PORT || 8082);
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+// LLM backend: "aistudio" (default — simple GEMINI_API_KEY) or "vertex" (Google Cloud Vertex AI,
+// OAuth via a service account). The request/response body is the SAME Gemini schema for both, so
+// only the endpoint + auth differ (see callGemini). Vertex unlocks the $300 trial / real billing
+// and sidesteps the AI Studio free-tier 20/day cliff.
+const LLM_PROVIDER = (process.env.LLM_PROVIDER || "aistudio").toLowerCase();
+const VERTEX_PROJECT = process.env.GOOGLE_CLOUD_PROJECT || "";
+const VERTEX_LOCATION = process.env.GOOGLE_CLOUD_LOCATION || "us-central1";
+const VERTEX_URL = `https://${VERTEX_LOCATION}-aiplatform.googleapis.com/v1/projects/${VERTEX_PROJECT}/locations/${VERTEX_LOCATION}/publishers/google/models/${GEMINI_MODEL}:generateContent`;
 const RETRIEVAL_API_URL = (process.env.RETRIEVAL_API_URL || "http://retrieval-api:8088").replace(/\/$/, "");
 const RETRIEVAL_API_KEY = process.env.RETRIEVAL_API_KEY || "";
 const CHATWOOT_URL = (process.env.CHATWOOT_URL || "http://chatwoot-rails:3000").replace(/\/$/, "");
@@ -48,6 +56,11 @@ const DIRECTUS_TOKEN = process.env.DIRECTUS_TOKEN || "";
 const AGENT_MAX_IMAGES = Number(process.env.AGENT_MAX_IMAGES || 3);
 const AGENT_MAX_STEPS = Number(process.env.AGENT_MAX_STEPS || 6); // order turn = get_product + capture_order + answer
 const AGENT_HISTORY_TURNS = Number(process.env.AGENT_HISTORY_TURNS || 16);
+// Debounce window: how long to wait for the customer to stop sending before we process. A burst of
+// rapid-fire messages ("salam" / "3andkom basket?" / "noir?") is merged into ONE turn the model
+// answers with full context, instead of N separate replies. Each new message resets the timer; the
+// agent fires only after this many ms of silence.
+const AGENT_DEBOUNCE_MS = Number(process.env.AGENT_DEBOUNCE_MS || 4000);
 
 const REDIS_URL =
   process.env.REDIS_URL || `redis://:${process.env.REDIS_PASSWORD || "changeme"}@redis:6379`;
@@ -129,7 +142,32 @@ const redis = createClient({ url: REDIS_URL });
 redis.on("error", (err) => console.error("[redis] error:", err.message));
 await redis.connect();
 console.log("[redis] connected");
-if (!GEMINI_API_KEY) console.error("[startup] WARNING: GEMINI_API_KEY is empty — agent will escalate every turn.");
+
+// LLM auth. aistudio → GEMINI_API_KEY (query param). vertex → OAuth Bearer from a service account
+// (Application Default Credentials: GOOGLE_APPLICATION_CREDENTIALS points at the key JSON, or the
+// VM's attached service account). google-auth-library is imported lazily so an AI-Studio-only
+// install never needs it. The library caches the token and refreshes it before expiry, so calling
+// vertexToken() per request is cheap.
+let _googleAuth = null;
+async function vertexToken() {
+  if (!_googleAuth) {
+    const { GoogleAuth } = await import("google-auth-library");
+    _googleAuth = new GoogleAuth({ scopes: "https://www.googleapis.com/auth/cloud-platform" });
+  }
+  const client = await _googleAuth.getClient();
+  const t = await client.getAccessToken();
+  const token = typeof t === "string" ? t : t?.token;
+  if (!token) throw new Error("vertex: could not obtain an access token (check the service account / ADC)");
+  return token;
+}
+
+if (LLM_PROVIDER === "vertex") {
+  if (!VERTEX_PROJECT) console.error("[startup] WARNING: LLM_PROVIDER=vertex but GOOGLE_CLOUD_PROJECT is empty.");
+  else console.log(`[startup] LLM provider: vertex (project=${VERTEX_PROJECT} location=${VERTEX_LOCATION} model=${GEMINI_MODEL})`);
+} else {
+  if (!GEMINI_API_KEY) console.error("[startup] WARNING: GEMINI_API_KEY is empty — agent will escalate every turn.");
+  else console.log(`[startup] LLM provider: aistudio (model=${GEMINI_MODEL})`);
+}
 
 // ---------------------------------------------------------------------------
 // Tenant resolution (multi-tenant). Map a Chatwoot inbox_id → merchant (tenant), cached from
@@ -479,12 +517,17 @@ async function callGemini(tenant, contents) {
     if (attempt > 0) await new Promise((r) => setTimeout(r, 600 * 2 ** (attempt - 1))); // 0.6s,1.2s,2.4s
     let res;
     try {
-      res = await fetch(`${GEMINI_URL}?key=${GEMINI_API_KEY}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
-    } catch (e) { lastErr = e; continue; } // network blip → retry
+      // Same Gemini body for both backends — only the endpoint + auth differ.
+      let endpoint, headers;
+      if (LLM_PROVIDER === "vertex") {
+        endpoint = VERTEX_URL;
+        headers = { "Content-Type": "application/json", Authorization: `Bearer ${await vertexToken()}` };
+      } else {
+        endpoint = `${GEMINI_URL}?key=${GEMINI_API_KEY}`;
+        headers = { "Content-Type": "application/json" };
+      }
+      res = await fetch(endpoint, { method: "POST", headers, body: JSON.stringify(body) });
+    } catch (e) { lastErr = e; continue; } // network blip / token fetch → retry
     if (res.ok) {
       const data = await res.json();
       const cand = data?.candidates?.[0];
@@ -580,6 +623,235 @@ function trimHistory(contents) {
 }
 
 // ---------------------------------------------------------------------------
+// Debounce + per-conversation serialization.
+//   pendingTurns:   convId → { entries:[{query,attachments}], ctx, timer }  (messages buffered
+//                   during the silence window; ctx = latest webhook's conversation/contact/body).
+//   processingConvs: convId currently being processed — the LOCK. A conversation never has two
+//                   turns running at once, so memory reads/writes can't race (out-of-order webhooks,
+//                   or a new message arriving mid-run, are handled cleanly).
+// Single agent-handler instance → in-process maps are sufficient (and avoid serializing media to
+// Redis). A container restart drops an in-flight buffer (rare; the customer simply re-sends).
+// ---------------------------------------------------------------------------
+const pendingTurns = new Map();
+const processingConvs = new Set();
+
+/** Fire when the debounce timer elapses: process the buffered burst as one turn, honoring the
+ *  per-conversation lock. */
+async function drainConv(convId) {
+  const buf = pendingTurns.get(convId);
+  if (!buf || !buf.entries.length) return;
+  // A run is already in flight for this conversation → don't overlap. Re-arm a short timer and
+  // keep the buffer; we'll drain once the current turn finishes.
+  if (processingConvs.has(convId)) {
+    if (buf.timer) clearTimeout(buf.timer);
+    buf.timer = setTimeout(() => drainConv(convId).catch((e) => console.error(`[debounce] drain error: ${e.message}`)), 1000);
+    return;
+  }
+  pendingTurns.delete(convId);
+  processingConvs.add(convId);
+  try {
+    await processConvTurn(convId, buf.entries, buf.ctx);
+  } catch (err) {
+    console.error(`[turn] conv=${convId} error: ${err.message}`);
+  } finally {
+    processingConvs.delete(convId);
+    // If new messages arrived while we were processing, they created a fresh buffer + timer
+    // already — leave it to fire on its own.
+  }
+}
+
+/**
+ * Process one (possibly merged) customer turn: build parts from every buffered message, load
+ * memory, resolve tenant + ad attribution, run the agent, and post the single reply.
+ * `entries` = [{query, attachments}] collected during the debounce window. `ctx` = latest
+ * webhook's { conversation, contact, body }.
+ */
+async function processConvTurn(convId, entries, ctx) {
+  const { conversation, contact, body } = ctx;
+  const chatwootConvId = String(convId);
+  // Merge the burst: all texts joined (newline = the customer's separate bubbles), all
+  // attachments concatenated. The model sees the whole thought, not fragments.
+  const { query, attachments } = mergeTurnEntries(entries);
+  const contactId = String(contact?.id || body.sender?.id || "unknown");
+  console.log(`[turn] conv=${chatwootConvId} contact=${contactId} merged ${entries.length} message(s) query="${query.slice(0, 80)}" attachments=${attachments.length}`);
+
+  // Build this turn's user parts: text + image attachments (vision) + audio (voice notes).
+  const userParts = [];
+  if (query) userParts.push({ text: query });
+  let hadMedia = false;
+  let sawImage = false;
+  for (const att of attachments) {
+    const dataUrl = att?.data_url || att?.url || att?.thumb_url;
+    if (!dataUrl) continue;
+    const isImage = (att?.file_type === "image") || /\.(png|jpe?g|webp|gif)$/i.test(String(dataUrl));
+    const isAudio = (att?.file_type === "audio") || /\.(ogg|oga|mp3|m4a|aac|wav|opus)$/i.test(String(dataUrl));
+    if (!isImage && !isAudio) continue;
+    const part = await mediaPartFromUrl(dataUrl, isAudio ? "audio" : "image");
+    if (part) { userParts.push(part); hadMedia = true; if (isImage) sawImage = true; }
+  }
+
+  // IMAGE CARRY-FORWARD: covers the cross-window case (image in one debounce turn, the follow-up
+  // text in a LATER turn). Within a single window an image + its caption are already merged above.
+  const imgKey = `agent:img:${chatwootConvId}`;
+  if (sawImage) {
+    const imgParts = userParts.filter((p) => p.inlineData && String(p.inlineData.mimeType).startsWith("image/"));
+    try { await redis.set(imgKey, JSON.stringify(imgParts), { EX: 180 }); } catch {}
+  } else if (query) {
+    try {
+      const rawImg = await redis.get(imgKey);
+      const cachedImgs = rawImg ? JSON.parse(rawImg) : null;
+      if (Array.isArray(cachedImgs) && cachedImgs.length) {
+        userParts.unshift(...cachedImgs);
+        console.log(`[image] carried forward ${cachedImgs.length} cached image(s) into text turn conv=${chatwootConvId}`);
+      }
+    } catch {}
+  }
+
+  // If the customer ONLY sent media (no text), nudge the model to act on it. For an image with no
+  // clear question, the model must ASK what the customer wants (NOT hand off).
+  if (hadMedia && !query) {
+    userParts.push({ text: "(le client a envoyé un média ci-dessus — comprends-le et réponds; si c'est l'image d'un produit, identifie-le et appelle get_product; si tu ne sais pas ce qu'il veut, demande-lui brièvement ce qu'il veut savoir — NE fais PAS de handoff)" });
+  }
+  if (userParts.length === 0) userParts.push({ text: "(message vide)" });
+
+  // LANDMINE 2 — load conversation memory.
+  const storeKey = `agent:hist:${chatwootConvId}`;
+  let history = [];
+  try {
+    const raw = await redis.get(storeKey);
+    // sanitize on read too, so any legacy history that still holds functionCall/response
+    // scaffolding (which can 400 Gemini) self-heals instead of breaking the conversation.
+    if (raw) history = sanitizeHistory(JSON.parse(raw));
+  } catch (e) {
+    console.error(`[memory] load error: ${e.message}`);
+  }
+
+  // Resolve which tenant (merchant) this inbox serves. retrieval-api is queried scoped to this
+  // merchant_id so catalogs never bleed across tenants. Unmapped inbox → is_default (SIRINE).
+  const inboxId = conversation?.inbox_id ?? body.inbox?.id ?? conversation?.inbox?.id;
+  const tenant = await resolveTenant(inboxId);
+  if (!tenant) {
+    console.error(`[tenant] no merchant resolved for inbox=${inboxId} — escalating`);
+    await escalate(chatwootConvId, `no tenant mapped for inbox ${inboxId}`);
+    return;
+  }
+  console.log(`[tenant] inbox=${inboxId} → ${tenant.name} (${tenant.merchant_id})`);
+
+  // AD ATTRIBUTION: the Meta relay stored the clicked ad by PSID; pin it to this
+  // conversation (capture_order reads agent:ad:conv:<id> at save time). On the very
+  // first turn, also tell the model WHICH product the ad was about (grounded via the
+  // ads collection in the catalog) so it can answer without guessing.
+  try {
+    const psid = conversation?.contact_inbox?.source_id || body.contact_inbox?.source_id;
+    const convAdKey = `agent:ad:conv:${chatwootConvId}`;
+    let attribution = JSON.parse((await redis.get(convAdKey)) || "null");
+    if (!attribution && psid) {
+      attribution = JSON.parse((await redis.get(`agent:ad:psid:${psid}`)) || "null");
+      if (attribution) {
+        await redis.set(convAdKey, JSON.stringify(attribution), { EX: AD_ATTRIBUTION_TTL });
+        console.log(`[ads] conv=${chatwootConvId} attributed to ad_id=${attribution.ad_id}`);
+      }
+    }
+    if (attribution?.ad_id && history.length === 0) {
+      const u = new URL(`${RETRIEVAL_API_URL}/get_product`);
+      u.searchParams.set("ad_id", attribution.ad_id);
+      u.searchParams.set("merchant_id", tenant.merchant_id);
+      const r = await fetch(u, { headers: { "x-api-key": RETRIEVAL_API_KEY } });
+      const d = r.ok ? await r.json() : null;
+      if (d?.found && d.product?.name) {
+        userParts.push({ text: `(contexte système : le client arrive d'une publicité Facebook pour le produit « ${d.product.name} » — c'est très probablement le produit dont il parle ; vérifie avec get_product avant d'affirmer un fait)` });
+      }
+    }
+  } catch (err) {
+    console.error(`[ads] attribution lookup error: ${err.message}`);
+  }
+
+  // Run the agent.
+  let result;
+  try {
+    result = await runAgent(tenant, history, userParts, chatwootConvId);
+  } catch (err) {
+    console.error(`[agent] error: ${err.message}`);
+    if (err.code === "quota_daily") {
+      // GRACEFUL 429 DEGRADE: the daily Gemini quota is gone — do NOT dump every customer
+      // into the human queue. Tell the customer ONCE (per conversation, per day) that the
+      // team will follow up, leave the conversation in `pending`, and note it for the team.
+      const quotaKey = `agent:quotamsg:${chatwootConvId}`;
+      const already = await redis.get(quotaKey).catch(() => null);
+      if (!already) {
+        await redis.set(quotaKey, "1", { EX: 86400 }).catch(() => {});
+        await chatwootPost(chatwootConvId, {
+          content: "معليش خويا/ختي، عندنا ضغط كبير دروك 🙏 واحد من الفريق يجاوبك في أقرب وقت إن شاء الله.",
+          message_type: "outgoing",
+          private: false,
+          content_type: "text",
+        });
+        await chatwootPost(chatwootConvId, { content: "Bot paused: Gemini daily quota exhausted (HTTP 429 per-day). Customers get a polite wait message; conversations stay pending.", private: true });
+      }
+      return;
+    }
+    await escalate(chatwootConvId, `agent error: ${err.message}`);
+    return;
+  }
+
+  if (!result.ok || !result.answer) {
+    await escalate(chatwootConvId, "agent produced no grounded answer");
+    return;
+  }
+
+  // Persist trimmed memory.
+  try {
+    await redis.set(storeKey, JSON.stringify(trimHistory(result.contents)), { EX: 86400 });
+  } catch (e) {
+    console.error(`[memory] save error: ${e.message}`);
+  }
+
+  // Image delivery: when the model emits the [[IMG]] marker, fetch the resolved product's
+  // image bytes from Directus and upload them to Chatwoot as REAL attachments (Messenger then
+  // shows actual photos instead of dead localhost links). Strip the marker from the text.
+  const wantsImages = /\[\[IMG\]\]/.test(result.answer);
+  // [[HANDOFF]] = the model couldn't help (didn't understand, can't identify a product,
+  // customer wants a human, question beyond catalog) → send the wait message then hand to a human.
+  const wantsHandoff = /\[\[HANDOFF\]\]/.test(result.answer);
+  const cleanAnswer = result.answer
+    .replace(/\[\[IMG\]\]/g, "")
+    .replace(/\[\[HANDOFF\]\]/g, "")
+    .replace(/https?:\/\/\S*\/assets\/[0-9a-fA-F-]{36}\S*/g, "") // never leak dead asset URLs
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim() || "📷";
+  let sentWithImages = false;
+  if (wantsImages && result.images && result.images.length) {
+    const picked = result.images.slice(0, AGENT_MAX_IMAGES);
+    const imgs = (await Promise.all(picked.map(fetchDirectusImage))).filter(Boolean);
+    if (imgs.length) {
+      await chatwootPostWithImages(chatwootConvId, cleanAnswer, imgs);
+      sentWithImages = true;
+      console.log(`[reply] conv=${chatwootConvId} images=${imgs.length} answer="${cleanAnswer.slice(0, 60)}"`);
+    }
+  }
+  if (!sentWithImages) {
+    // Plain text reply (no images requested, or image fetch failed → never drop the answer).
+    await chatwootPost(chatwootConvId, {
+      content: cleanAnswer,
+      message_type: "outgoing",
+      private: false,
+      content_type: "text",
+    });
+    console.log(`[reply] conv=${chatwootConvId} answer="${cleanAnswer.slice(0, 80)}"`);
+  }
+
+  // HAND-01 escalation — MODEL-DRIVEN ONLY (via [[HANDOFF]]). The model is instructed to give the
+  // customer a chance to re-explain BEFORE handing off; a single found:false (vague query) must NOT
+  // auto-escalate, or the bot would dump the customer on a human at the first misunderstanding and
+  // the conversation flips to "open" (bot goes silent). So we no longer auto-escalate on found:false
+  // — the model asks for clarification, and only emits [[HANDOFF]] once it's genuinely stuck.
+  if (wantsHandoff) {
+    await escalate(chatwootConvId, "model requested human handoff (after clarification / out of scope)");
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Main handler
 // ---------------------------------------------------------------------------
 
@@ -625,7 +897,6 @@ const server = http.createServer(async (req, res) => {
       }
 
       const chatwootConvId = String(conversation?.id || "");
-      const contactId = String(contact?.id || body.sender?.id || "unknown");
       const query = String(content || "").trim();
       const attachments = Array.isArray(body.attachments) ? body.attachments : [];
 
@@ -633,187 +904,18 @@ const server = http.createServer(async (req, res) => {
         return send(res, 200, { ok: true, skipped: true, reason: "empty conv or content" });
       }
 
-      console.log(`[agentbot] conv=${chatwootConvId} contact=${contactId} query="${query.slice(0, 80)}" attachments=${attachments.length}`);
-
-      // Ack immediately so Chatwoot's webhook does not time out; reply is posted async below.
+      // Ack immediately so Chatwoot's webhook does not time out.
       send(res, 200, { ok: true });
 
-      // Build this turn's user parts: text + image attachments (vision) + audio (voice notes).
-      const userParts = [];
-      if (query) userParts.push({ text: query });
-      let hadMedia = false;
-      let sawImage = false;
-      for (const att of attachments) {
-        const dataUrl = att?.data_url || att?.url || att?.thumb_url;
-        if (!dataUrl) continue;
-        const isImage = (att?.file_type === "image") || /\.(png|jpe?g|webp|gif)$/i.test(String(dataUrl));
-        const isAudio = (att?.file_type === "audio") || /\.(ogg|oga|mp3|m4a|aac|wav|opus)$/i.test(String(dataUrl));
-        if (!isImage && !isAudio) continue;
-        const part = await mediaPartFromUrl(dataUrl, isAudio ? "audio" : "image");
-        if (part) { userParts.push(part); hadMedia = true; if (isImage) sawImage = true; }
-      }
-
-      // IMAGE CARRY-FORWARD: Messenger sends an image and its text question as TWO separate messages
-      // (two webhooks). Without this, the image-only turn has no question and the text-only turn answers
-      // blind (wrong product). So cache the latest image briefly and re-attach it to a following
-      // text-only turn → "[image] … then 'is this still available?'" is understood together.
-      const imgKey = `agent:img:${chatwootConvId}`;
-      if (sawImage) {
-        const imgParts = userParts.filter((p) => p.inlineData && String(p.inlineData.mimeType).startsWith("image/"));
-        try { await redis.set(imgKey, JSON.stringify(imgParts), { EX: 180 }); } catch {}
-      } else if (query) {
-        try {
-          const rawImg = await redis.get(imgKey);
-          const cachedImgs = rawImg ? JSON.parse(rawImg) : null;
-          if (Array.isArray(cachedImgs) && cachedImgs.length) {
-            userParts.unshift(...cachedImgs);
-            console.log(`[image] carried forward ${cachedImgs.length} cached image(s) into text turn conv=${chatwootConvId}`);
-          }
-        } catch {}
-      }
-
-      // If the customer ONLY sent media (no text), nudge the model to act on it. For an image with no
-      // clear question, the model must ASK what the customer wants (NOT hand off).
-      if (hadMedia && !query) {
-        userParts.push({ text: "(le client a envoyé un média ci-dessus — comprends-le et réponds; si c'est l'image d'un produit, identifie-le et appelle get_product; si tu ne sais pas ce qu'il veut, demande-lui brièvement ce qu'il veut savoir — NE fais PAS de handoff)" });
-      }
-      if (userParts.length === 0) userParts.push({ text: "(message vide)" });
-
-      // LANDMINE 2 — load conversation memory.
-      const storeKey = `agent:hist:${chatwootConvId}`;
-      let history = [];
-      try {
-        const raw = await redis.get(storeKey);
-        // sanitize on read too, so any legacy history that still holds functionCall/response
-        // scaffolding (which can 400 Gemini) self-heals instead of breaking the conversation.
-        if (raw) history = sanitizeHistory(JSON.parse(raw));
-      } catch (e) {
-        console.error(`[memory] load error: ${e.message}`);
-      }
-
-      // Resolve which tenant (merchant) this inbox serves. retrieval-api is queried scoped to this
-      // merchant_id so catalogs never bleed across tenants. Unmapped inbox → is_default (SIRINE).
-      const inboxId = conversation?.inbox_id ?? body.inbox?.id ?? conversation?.inbox?.id;
-      const tenant = await resolveTenant(inboxId);
-      if (!tenant) {
-        console.error(`[tenant] no merchant resolved for inbox=${inboxId} — escalating`);
-        await escalate(chatwootConvId, `no tenant mapped for inbox ${inboxId}`);
-        return;
-      }
-      console.log(`[tenant] inbox=${inboxId} → ${tenant.name} (${tenant.merchant_id})`);
-
-      // AD ATTRIBUTION: the Meta relay stored the clicked ad by PSID; pin it to this
-      // conversation (capture_order reads agent:ad:conv:<id> at save time). On the very
-      // first turn, also tell the model WHICH product the ad was about (grounded via the
-      // ads collection in the catalog) so it can answer without guessing.
-      try {
-        const psid = conversation?.contact_inbox?.source_id || body.contact_inbox?.source_id;
-        const convAdKey = `agent:ad:conv:${chatwootConvId}`;
-        let attribution = JSON.parse((await redis.get(convAdKey)) || "null");
-        if (!attribution && psid) {
-          attribution = JSON.parse((await redis.get(`agent:ad:psid:${psid}`)) || "null");
-          if (attribution) {
-            await redis.set(convAdKey, JSON.stringify(attribution), { EX: AD_ATTRIBUTION_TTL });
-            console.log(`[ads] conv=${chatwootConvId} attributed to ad_id=${attribution.ad_id}`);
-          }
-        }
-        if (attribution?.ad_id && history.length === 0) {
-          const u = new URL(`${RETRIEVAL_API_URL}/get_product`);
-          u.searchParams.set("ad_id", attribution.ad_id);
-          u.searchParams.set("merchant_id", tenant.merchant_id);
-          const r = await fetch(u, { headers: { "x-api-key": RETRIEVAL_API_KEY } });
-          const d = r.ok ? await r.json() : null;
-          if (d?.found && d.product?.name) {
-            userParts.push({ text: `(contexte système : le client arrive d'une publicité Facebook pour le produit « ${d.product.name} » — c'est très probablement le produit dont il parle ; vérifie avec get_product avant d'affirmer un fait)` });
-          }
-        }
-      } catch (err) {
-        console.error(`[ads] attribution lookup error: ${err.message}`);
-      }
-
-      // Run the agent.
-      let result;
-      try {
-        result = await runAgent(tenant, history, userParts, chatwootConvId);
-      } catch (err) {
-        console.error(`[agent] error: ${err.message}`);
-        if (err.code === "quota_daily") {
-          // GRACEFUL 429 DEGRADE: the daily Gemini quota is gone — do NOT dump every customer
-          // into the human queue. Tell the customer ONCE (per conversation, per day) that the
-          // team will follow up, leave the conversation in `pending`, and note it for the team.
-          const quotaKey = `agent:quotamsg:${chatwootConvId}`;
-          const already = await redis.get(quotaKey).catch(() => null);
-          if (!already) {
-            await redis.set(quotaKey, "1", { EX: 86400 }).catch(() => {});
-            await chatwootPost(chatwootConvId, {
-              content: "معليش خويا/ختي، عندنا ضغط كبير دروك 🙏 واحد من الفريق يجاوبك في أقرب وقت إن شاء الله.",
-              message_type: "outgoing",
-              private: false,
-              content_type: "text",
-            });
-            await chatwootPost(chatwootConvId, { content: "Bot paused: Gemini daily quota exhausted (HTTP 429 per-day). Customers get a polite wait message; conversations stay pending.", private: true });
-          }
-          return;
-        }
-        await escalate(chatwootConvId, `agent error: ${err.message}`);
-        return;
-      }
-
-      if (!result.ok || !result.answer) {
-        await escalate(chatwootConvId, "agent produced no grounded answer");
-        return;
-      }
-
-      // Persist trimmed memory.
-      try {
-        await redis.set(storeKey, JSON.stringify(trimHistory(result.contents)), { EX: 86400 });
-      } catch (e) {
-        console.error(`[memory] save error: ${e.message}`);
-      }
-
-      // Image delivery: when the model emits the [[IMG]] marker, fetch the resolved product's
-      // image bytes from Directus and upload them to Chatwoot as REAL attachments (Messenger then
-      // shows actual photos instead of dead localhost links). Strip the marker from the text.
-      const wantsImages = /\[\[IMG\]\]/.test(result.answer);
-      // [[HANDOFF]] = the model couldn't help (didn't understand, can't identify a product,
-      // customer wants a human, question beyond catalog) → send the wait message then hand to a human.
-      const wantsHandoff = /\[\[HANDOFF\]\]/.test(result.answer);
-      const cleanAnswer = result.answer
-        .replace(/\[\[IMG\]\]/g, "")
-        .replace(/\[\[HANDOFF\]\]/g, "")
-        .replace(/https?:\/\/\S*\/assets\/[0-9a-fA-F-]{36}\S*/g, "") // never leak dead asset URLs
-        .replace(/[ \t]{2,}/g, " ")
-        .replace(/\n{3,}/g, "\n\n")
-        .trim() || "📷";
-      let sentWithImages = false;
-      if (wantsImages && result.images && result.images.length) {
-        const picked = result.images.slice(0, AGENT_MAX_IMAGES);
-        const imgs = (await Promise.all(picked.map(fetchDirectusImage))).filter(Boolean);
-        if (imgs.length) {
-          await chatwootPostWithImages(chatwootConvId, cleanAnswer, imgs);
-          sentWithImages = true;
-          console.log(`[reply] conv=${chatwootConvId} images=${imgs.length} answer="${cleanAnswer.slice(0, 60)}"`);
-        }
-      }
-      if (!sentWithImages) {
-        // Plain text reply (no images requested, or image fetch failed → never drop the answer).
-        await chatwootPost(chatwootConvId, {
-          content: cleanAnswer,
-          message_type: "outgoing",
-          private: false,
-          content_type: "text",
-        });
-        console.log(`[reply] conv=${chatwootConvId} answer="${cleanAnswer.slice(0, 80)}"`);
-      }
-
-      // HAND-01 escalation — MODEL-DRIVEN ONLY (via [[HANDOFF]]). The model is instructed to give the
-      // customer a chance to re-explain BEFORE handing off; a single found:false (vague query) must NOT
-      // auto-escalate, or the bot would dump the customer on a human at the first misunderstanding and
-      // the conversation flips to "open" (bot goes silent). So we no longer auto-escalate on found:false
-      // — the model asks for clarification, and only emits [[HANDOFF]] once it's genuinely stuck.
-      if (wantsHandoff) {
-        await escalate(chatwootConvId, "model requested human handoff (after clarification / out of scope)");
-      }
+      // DEBOUNCE: buffer this message and (re)start the silence timer. A burst of rapid messages
+      // is merged into ONE turn (processConvTurn) once the customer pauses AGENT_DEBOUNCE_MS.
+      const buf = pendingTurns.get(chatwootConvId) || { entries: [], ctx: null, timer: null };
+      buf.entries.push({ query, attachments });
+      buf.ctx = { conversation, contact, body }; // latest webhook wins (newest inbox/psid/status)
+      if (buf.timer) clearTimeout(buf.timer);
+      buf.timer = setTimeout(() => drainConv(chatwootConvId).catch((e) => console.error(`[debounce] drain error: ${e.message}`)), AGENT_DEBOUNCE_MS);
+      pendingTurns.set(chatwootConvId, buf);
+      console.log(`[agentbot] conv=${chatwootConvId} buffered (${buf.entries.length} pending) query="${query.slice(0, 60)}" attachments=${attachments.length}`);
       return;
     }
 

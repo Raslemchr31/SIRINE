@@ -12,18 +12,22 @@ same way (fronted by your domain / reverse proxy — see INSTALL.md).
 1. **Loop prevention** — acts only on `message_created` + `incoming`; everything else → 200 no-op.
 2. **Human lane** — conversations in `open`/`resolved` status are skipped (a human owns them);
    the bot answers only `pending` conversations.
-3. **Media** — image attachments go to Gemini vision; voice notes go to Gemini audio. An image
+3. **Debounce** — rapid-fire messages are buffered and merged into ONE turn. The bot waits
+   `AGENT_DEBOUNCE_MS` (default 4000) of silence, then answers all of them together with full
+   context — instead of one reply per bubble. A per-conversation lock serializes turns so memory
+   never races. Works for any count, including a single message (which then waits the window once).
+4. **Media** — image attachments go to Gemini vision; voice notes go to Gemini audio. An image
    is cached briefly (Redis) and re-attached to the customer's follow-up text message, because
    Messenger sends image and caption as two separate webhooks.
-4. **Memory** — prior text turns are replayed from Redis (`agent:hist:{conversation_id}`,
+5. **Memory** — prior text turns are replayed from Redis (`agent:hist:{conversation_id}`,
    trimmed to `AGENT_HISTORY_TURNS`).
-5. **Grounding** — the model must call `get_product` (retrieval-api) before stating any catalog
+6. **Grounding** — the model must call `get_product` (retrieval-api) before stating any catalog
    fact; product photos are fetched from Directus and uploaded to Chatwoot as real attachments
    when the model emits `[[IMG]]`.
-6. **Orders** — when the customer confirms a purchase the model calls `capture_order`; the
+7. **Orders** — when the customer confirms a purchase the model calls `capture_order`; the
    handler validates everything server-side (DZ phone, wilaya, re-verified price, computed
    shipping from `shipping.json`) and writes the order to Directus.
-7. **Handoff** — `[[HANDOFF]]` posts a private note and flips the conversation to `open`
+8. **Handoff** — `[[HANDOFF]]` posts a private note and flips the conversation to `open`
    (human queue). Errors and quota exhaustion degrade politely instead of going silent.
 
 ## Files

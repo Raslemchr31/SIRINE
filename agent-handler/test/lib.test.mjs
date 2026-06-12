@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { toE164DZ, findWilaya, renderShippingTable, extractReferrals, validateOrderArgs } from "../lib.mjs";
+import { toE164DZ, findWilaya, renderShippingTable, extractReferrals, validateOrderArgs, mergeTurnEntries } from "../lib.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SHIPPING = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "shipping.json"), "utf8"));
@@ -103,6 +103,36 @@ test("validateOrderArgs — invalid phone flagged", () => {
     SHIPPING,
   );
   assert.deepEqual(r.error.missing, ["phone"]);
+});
+
+test("mergeTurnEntries — merges a rapid-fire burst into one turn", () => {
+  const r = mergeTurnEntries([
+    { query: "salam", attachments: [] },
+    { query: "3andkom basket signature?", attachments: [] },
+    { query: "noir?", attachments: [] },
+  ]);
+  assert.equal(r.query, "salam\n3andkom basket signature?\nnoir?");
+  assert.deepEqual(r.attachments, []);
+});
+
+test("mergeTurnEntries — single message is unchanged", () => {
+  const r = mergeTurnEntries([{ query: "wesh rak", attachments: [] }]);
+  assert.equal(r.query, "wesh rak");
+});
+
+test("mergeTurnEntries — concatenates attachments, drops empty texts", () => {
+  const r = mergeTurnEntries([
+    { query: "", attachments: [{ file_type: "image", data_url: "a.jpg" }] },
+    { query: "hada?", attachments: [{ file_type: "audio", data_url: "b.ogg" }] },
+  ]);
+  assert.equal(r.query, "hada?");
+  assert.equal(r.attachments.length, 2);
+});
+
+test("mergeTurnEntries — empty / malformed input is safe", () => {
+  assert.deepEqual(mergeTurnEntries([]), { query: "", attachments: [] });
+  assert.deepEqual(mergeTurnEntries(null), { query: "", attachments: [] });
+  assert.deepEqual(mergeTurnEntries([{}, { query: null }]), { query: "", attachments: [] });
 });
 
 test("validateOrderArgs — wilaya with no rate hands off", () => {

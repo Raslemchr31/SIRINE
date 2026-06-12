@@ -34,7 +34,21 @@ base() { # base convId status text  -> JSON webhook body
 echo "SIRINE bot — live smoke test"
 echo "Gemini key set: $([ -n "$(envget GEMINI_API_KEY)" ] && echo yes || echo 'NO — bot will escalate every turn')"
 
+# Post a webhook WITHOUT waiting (for burst tests).
+post() { docker run --rm --network "$NET" curlimages/curl:8.10.1 -s -o /dev/null \
+  -X POST http://agent-handler:8082/agentbot -H 'Content-Type: application/json' -d "$1"; }
+
 fire 990001 "$(base 990001 pending '"salam"')" "greeting (no get_product, warm welcome)"
+
+echo; echo "── DEBOUNCE — 3 rapid messages → expect ONE merged reply ──"
+post "$(base 990008 pending '"salam"')"
+post "$(base 990008 pending '"3andkom basket signature?"')"
+post "$(base 990008 pending '"bch7al w 3andkom noir?"')"
+echo "  posted 3 messages back-to-back (conv 990008); waiting for the debounce window…"
+sleep 10
+echo "  bot reply (should answer all three together):"
+redis GET "agent:hist:990008" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const a=JSON.parse(s);const last=[...a].reverse().find(c=>c.role==="model");console.log("   "+(last?last.parts.map(p=>p.text).join(" "):"(no model turn)"));const userTurns=a.filter(c=>c.role==="user").length;const botTurns=a.filter(c=>c.role==="model").length;console.log(`   [turns] user=${userTurns} bot=${botTurns} (expect 1 bot reply, not 3)`);}catch{console.log("   (no history)")}})'
+
 fire 990002 "$(base 990002 pending '"3andkom basket signature? bch7al?"')" "product grounding (price from catalog)"
 fire 990003 "$(base 990003 pending '"werini tswira ta3 basket signature"')" "image request ([[IMG]] → photo)"
 fire 990004 "$(base 990004 pending '"9adach toswil l Oran?"')" "shipping per-wilaya (home + desk)"
@@ -57,5 +71,5 @@ docker compose exec -T postgres psql -U "$(envget POSTGRES_USER)" -d directus -c
   || echo "  (could not read orders table)"
 
 echo; echo "Cleanup test conversations from Redis:"
-for id in 990001 990002 990003 990004 990005 990006 990007 990010 990011; do redis DEL "agent:hist:$id" >/dev/null; done
+for id in 990001 990002 990003 990004 990005 990006 990007 990008 990010 990011; do redis DEL "agent:hist:$id" >/dev/null; done
 echo "  done. (Delete the test order rows in Directus → Orders if you want a clean slate.)"

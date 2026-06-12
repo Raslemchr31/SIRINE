@@ -68,6 +68,15 @@ export function extractReferrals(payload) {
   return out;
 }
 
+/** Merge a debounced burst of buffered messages into one turn: join the texts (each separate
+ *  customer bubble on its own line) and concatenate every attachment. Pure → unit-testable. */
+export function mergeTurnEntries(entries) {
+  const list = Array.isArray(entries) ? entries : [];
+  const query = list.map((e) => (e && e.query) || "").filter(Boolean).join("\n").trim();
+  const attachments = list.flatMap((e) => (e && Array.isArray(e.attachments) ? e.attachments : []));
+  return { query, attachments };
+}
+
 /** Validate the customer-supplied order fields (everything BEFORE the catalog price lookup).
  *  Pure: no catalog/price logic here. Returns either
  *    { error: {saved:false, reason, missing?} }  — give this straight back to the model, or

@@ -27,6 +27,10 @@ no duplication, so these tests guard the real code path).
 | `validateOrderArgs` missing | collects every missing/invalid field at once (the bot then asks) |
 | `validateOrderArgs` bad phone | `0451234567` flagged as `phone` |
 | `validateOrderArgs` no-rate wilaya | hands off instead of saving |
+| `mergeTurnEntries` burst | 3 rapid messages → one merged turn (texts joined, attachments concatenated) |
+| `mergeTurnEntries` single / empty | 1 message unchanged; empty/malformed input safe |
+
+16 tests total, all green.
 
 ### A2. Static validation — every changed file parses
 - `node --check` on `server.mjs`, `lib.mjs`, `lib.test.mjs`, `retrieval-api/server.mjs`,
@@ -67,6 +71,7 @@ prints each stored Darija reply, then dumps the `orders` table. Expected outcome
 | 7 | "bghit nahder m3a insan" | wait message + handoff (conversation flips to open) |
 | 8 | order happy path (3 turns) | bot collects fields, reads back total (price×qty + shipping), saves on "نأكد" |
 | 9 | order missing-field | bot **asks** for the missing details, **no** row saved |
+| 10 | debounce burst (3 rapid messages) | **one** merged reply addressing all three; `bot=1` turn in history, not 3 |
 
 Then verify in the browser:
 - **Directus → Orders**: the happy-path row exists with `phone_e164=+213551234567`,
