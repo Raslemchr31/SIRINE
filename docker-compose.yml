@@ -171,9 +171,13 @@ services:
       GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash}
       GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
       GOOGLE_CLOUD_LOCATION: ${GOOGLE_CLOUD_LOCATION:-us-central1}
-      # Vertex auth: drop the service-account key at ./agent-handler/vertex/sa.json (git-ignored);
-      # it's mounted read-only below and ADC reads it here. Harmless/ignored on aistudio.
-      GOOGLE_APPLICATION_CREDENTIALS: /app/vertex/sa.json
+      # Vertex auth (two ways):
+      #   GCP VM with an attached service account → leave this EMPTY; ADC uses the VM identity
+      #     (metadata server) automatically. No key file.
+      #   Non-GCP host → set GOOGLE_APPLICATION_CREDENTIALS=/app/vertex/sa.json in .env and drop the
+      #     key JSON at ./agent-handler/vertex/sa.json (git-ignored, mounted read-only below).
+      # Empty string = unset → google-auth-library falls back to ADC/metadata. Ignored on aistudio.
+      GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-}
       RETRIEVAL_API_URL: http://retrieval-api:8088
       RETRIEVAL_API_KEY: ${RETRIEVAL_API_KEY}
       # Directus assets (P6 image delivery): handler fetches product image bytes with this token
