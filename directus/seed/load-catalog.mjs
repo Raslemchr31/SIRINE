@@ -46,6 +46,12 @@ async function login() {
 const slug = (s) => s.toLowerCase().normalize("NFD").replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
 
 async function wipeMerchant(merchantId) {
+  // ads.linked_product_id has a DB foreign key to products — clear it first, or deleting the
+  // products fails (ads_linked_product_id_foreign). We keep the ad rows, just drop the link.
+  const ads = (await api("GET", `/items/ads?filter[merchant_id][_eq]=${merchantId}&filter[linked_product_id][_nnull]=true&limit=-1&fields=id`)).data;
+  for (const a of ads) await api("PATCH", `/items/ads/${a.id}`, { linked_product_id: null });
+  if (ads.length) console.log(`  cleared linked_product_id on ${ads.length} ads`);
+
   for (const coll of ["images", "variants", "products"]) {
     const ids = (await api("GET", `/items/${coll}?filter[merchant_id][_eq]=${merchantId}&limit=-1&fields=id`)).data.map((r) => r.id);
     if (ids.length) { await api("DELETE", `/items/${coll}`, ids); console.log(`  wiped ${ids.length} ${coll}`); }
