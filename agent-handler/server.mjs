@@ -809,7 +809,10 @@ async function processConvTurn(convId, entries, ctx) {
   // Image delivery: when the model emits the [[IMG]] marker, fetch the resolved product's
   // image bytes from Directus and upload them to Chatwoot as REAL attachments (Messenger then
   // shows actual photos instead of dead localhost links). Strip the marker from the text.
-  const wantsImages = /\[\[IMG\]\]/.test(result.answer);
+  // The model often writes a photo caption but FORGETS the marker, so also send when the
+  // CUSTOMER's own message clearly asks for a photo (keyword) and we have an image to send.
+  const askedPhoto = /photo|tswira|tsawer|sewra|sawra|\bimage\b|صور|تصاو|تصوير|نشوف|ورّ?يني|ورني|montre|\bvoir\b/i.test(query);
+  const wantsImages = /\[\[IMG\]\]/.test(result.answer) || askedPhoto;
   // [[HANDOFF]] = the model couldn't help (didn't understand, can't identify a product,
   // customer wants a human, question beyond catalog) → send the wait message then hand to a human.
   const wantsHandoff = /\[\[HANDOFF\]\]/.test(result.answer);
