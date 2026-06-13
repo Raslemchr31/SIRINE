@@ -85,6 +85,24 @@ async function resolveByQuery(q, merchantId) {
   return r.rows[0] ? { id: r.rows[0].id, score: Number(r.rows[0].score) } : null;
 }
 
+// List products for browsing: by category (exact) and/or a fuzzy keyword, scoped to the merchant.
+// Returns compact rows {name, price_dzd, category} so the agent can present the catalog and let the
+// customer pick one (then get_product gives the full detail + photo). Anti-hallucination: only real
+// active rows, never invented.
+async function listProducts({ category, q }, merchantId) {
+  const rows = (
+    await pool.query(
+      "SELECT name, category, base_price FROM products " +
+        "WHERE merchant_id=$1 AND status='active' " +
+        "AND ($2::text IS NULL OR lower(category)=lower($2)) " +
+        "AND ($3::text IS NULL OR search_text ILIKE '%'||lower($3)||'%') " +
+        "ORDER BY category, base_price NULLS LAST, name LIMIT 60",
+      [merchantId, category || null, q || null],
+    )
+  ).rows;
+  return rows.map((r) => ({ name: r.name, category: r.category, price_dzd: r.base_price }));
+}
+
 // Deterministic DZ phone normalization (libphonenumber comes in Phase 7; this stub covers the
 // common Algerian forms: 0[567]xxxxxxxx and +213[567]xxxxxxxx).
 function toE164DZ(raw) {
@@ -138,6 +156,15 @@ const server = http.createServer(async (req, res) => {
       const product = await loadProduct(productId, merchantId);
       if (!product) return send(res, 200, { found: false, resolved_by: resolvedBy });
       return send(res, 200, { found: true, resolved_by: resolvedBy, ...(score != null ? { score } : {}), product });
+    }
+
+    if (url.pathname === "/list_products" && req.method === "GET") {
+      const merchantId = url.searchParams.get("merchant_id");
+      if (!merchantId) return send(res, 400, { error: "merchant_id required" });
+      const category = url.searchParams.get("category");
+      const q = url.searchParams.get("q");
+      const products = await listProducts({ category, q }, merchantId);
+      return send(res, 200, { count: products.length, products });
     }
 
     if (url.pathname === "/capture_lead" && req.method === "POST") {

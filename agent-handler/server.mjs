@@ -135,6 +135,19 @@ const TOOLS = [{
       },
       required: ["customer_name", "phone", "wilaya", "product_name", "qty", "delivery_type"],
     },
+  }, {
+    name: "list_products",
+    description:
+      "Browse/list the catalog when the customer asks broadly ('what do you have', 'show me your bags', " +
+      "'vos sacs', 'wech 3andkom', 'tous les produits'). Returns the matching products with names + prices. " +
+      "Use it to present the list and let the customer pick one (then call get_product for that one's detail/photo).",
+    parameters: {
+      type: "object",
+      properties: {
+        category: { type: "string", enum: ["chaussures", "sacs", "accessoires", "packs"], description: "Filter by category, if the customer named one." },
+        query: { type: "string", description: "Optional keyword to narrow (e.g. 'nihel', 'sabo')." },
+      },
+    },
   }],
 }];
 
@@ -379,6 +392,24 @@ async function getProduct(args, merchantId) {
   }
 }
 
+/** Execute the list_products tool against retrieval-api (catalog browse), scoped to the tenant. */
+async function listProducts(args, merchantId) {
+  const u = new URL(`${RETRIEVAL_API_URL}/list_products`);
+  if (merchantId) u.searchParams.set("merchant_id", merchantId);
+  if (args?.category) u.searchParams.set("category", String(args.category));
+  if (args?.query) u.searchParams.set("q", String(args.query));
+  try {
+    const res = await fetch(u, { headers: { "x-api-key": RETRIEVAL_API_KEY } });
+    if (!res.ok) { console.error(`[list_products] ${res.status}`); return { count: 0, products: [] }; }
+    const data = await res.json();
+    console.log(`[list_products] category=${args?.category || "-"} q=${args?.query || "-"} → ${data?.count}`);
+    return data;
+  } catch (err) {
+    console.error(`[list_products] error: ${err.message}`);
+    return { count: 0, products: [] };
+  }
+}
+
 /**
  * Execute the capture_order tool. EVERYTHING money-related is recomputed server-side:
  * the unit price comes from a fresh get_product call (never the model's number) and the
@@ -577,6 +608,8 @@ async function runAgent(tenant, history, userParts, convId) {
       let result = { error: "unknown tool" };
       if (call.name === "capture_order") {
         result = await captureOrder(call.args || {}, tenant, convId);
+      } else if (call.name === "list_products") {
+        result = await listProducts(call.args || {}, tenant?.merchant_id);
       } else if (call.name === "get_product") {
         result = await getProduct(call.args || {}, tenant?.merchant_id);
         if (result && result.found === true) {
