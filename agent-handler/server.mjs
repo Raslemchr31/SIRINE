@@ -820,9 +820,21 @@ async function processConvTurn(convId, entries, ctx) {
     .replace(/[ \t]{2,}/g, " ")
     .replace(/\n{3,}/g, "\n\n")
     .trim() || "📷";
+  // Cache the most-recently-resolved product's images per conversation. So when the model emits
+  // [[IMG]] in a follow-up turn WITHOUT re-calling get_product (it answered from memory), we can
+  // still send the right photo instead of dropping it.
+  const lastImgKey = `agent:lastimg:${chatwootConvId}`;
+  if (result.images && result.images.length) {
+    try { await redis.set(lastImgKey, JSON.stringify(result.images), { EX: 3600 }); } catch {}
+  }
+  let imageUrls = (result.images && result.images.length) ? result.images : null;
+  if (wantsImages && !imageUrls) {
+    try { const raw = await redis.get(lastImgKey); if (raw) imageUrls = JSON.parse(raw); } catch {}
+  }
+
   let sentWithImages = false;
-  if (wantsImages && result.images && result.images.length) {
-    const picked = result.images.slice(0, AGENT_MAX_IMAGES);
+  if (wantsImages && imageUrls && imageUrls.length) {
+    const picked = imageUrls.slice(0, AGENT_MAX_IMAGES);
     const imgs = (await Promise.all(picked.map(fetchDirectusImage))).filter(Boolean);
     if (imgs.length) {
       await chatwootPostWithImages(chatwootConvId, cleanAnswer, imgs);
